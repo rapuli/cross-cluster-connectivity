@@ -31,23 +31,11 @@ usage: ${0} [FLAGS]
   Kind and the Cluster API provider for Docker (CAPD).
 FLAGS
   -h    show this help and exit
-  -u    deploy one kind cluster as the CAPI management cluster, then two CAPD
-        clusters ontop.
-  -d    destroy CAPD and kind clusters.
-Globals
-  KIND_MANAGEMENT_CLUSTER
-        name of the kind management cluster. default: management
-  SKIP_CAPD_IMAGE_LOAD
-        skip loading CAPD manager docker image.
-  SKIP_CLEANUP_CAPD_CLUSTERS
-        skip cleaning up CAPD clusters.
-  SKIP_CLEANUP_MGMT_CLUSTER
-        skip cleaning up CAPI kind management cluster.
+  -u    deploy one CAPI management cluster, and one CAPD cluster
+  -d    destroy both clusters
 Examples
-  Create e2e environment from existing kind cluster with name "my-kind"
-        KIND_MANAGEMENT_CLUSTER="my-kind" bash hack/e2e.sh -u
-  Destroys all CAPD clusters but not the kind management cluster
-        SKIP_CLEANUP_MGMT_CLUSTER="1" bash hack/e2e.sh -d
+  Create e2e environment: ./hack/e2e.sh -u
+  Destroy e2e environment: ./hack/e2e.sh -d
 EOF
 )"
 
@@ -63,25 +51,13 @@ CAPD_IMAGE="gcr.io/k8s-staging-cluster-api/capd-manager:${CAPI_VERSION}"
 CAPD_DEFAULT_IMAGE="gcr.io/k8s-staging-cluster-api/capd-manager:dev"
 # Runtime setup
 # By default do not skip anything.
-SKIP_CAPD_IMAGE_LOAD="${SKIP_CAPD_IMAGE_LOAD:-}"
-SKIP_CLEANUP_CAPD_CLUSTERS="${SKIP_CLEANUP_CAPD_CLUSTERS:-}"
-SKIP_CLEANUP_MGMT_CLUSTER="${SKIP_CLEANUP_MGMT_CLUSTER:-}"
 DEFAULT_IP_ADDR="${DEFAULT_IP_ADDR:-}"
 USE_HOST_IP_ADDR="${USE_HOST_IP_ADDR:-}"
 
 ROOT_DIR="${PWD}"
 SCRIPTS_DIR="${ROOT_DIR}/hack"
 
-IMAGE_REGISTRY="${IMAGE_REGISTRY:-ghcr.io/vmware-tanzu/cross-cluster-connectivity}"
-IMAGE_TAG="${IMAGE_TAG:-dev}"
-
-DNS_SERVER_IMAGE=${IMAGE_REGISTRY}/dns-server:${IMAGE_TAG}
-CAPI_DNS_CONTROLLER_IMAGE=${IMAGE_REGISTRY}/capi-dns-controller:${IMAGE_TAG}
-
 CLUSTER_A="cluster-a"
-CLUSTER_B="cluster-b"
-CLUSTER_A_KUBECONFIG="cluster-a.kubeconfig"
-CLUSTER_B_KUBECONFIG="cluster-b.kubeconfig"
 
 ################################################################################
 ##                                  require
@@ -142,9 +118,13 @@ function setup_management_cluster() {
       --name "${KIND_MANAGEMENT_CLUSTER}"
   fi
 
+  # load dev image of locally built cluster-api-controller
+  # https://cluster-api.sigs.k8s.io/clusterctl/developers.html
+  kind load docker-image gcr.io/k8s-staging-cluster-api/cluster-api-controller-amd64:dev --name management
   clusterctl init \
     --kubeconfig-context "kind-${KIND_MANAGEMENT_CLUSTER}" \
-    --core "cluster-api:v0.3.11"
+   --core cluster-api:v0.3.8 \
+   --config ~/.cluster-api/dev-repository/config.yaml
 
   # Enable the ClusterResourceSet feature in cluster API
   kubectl_mgc -n capi-webhook-system patch deployment capi-controller-manager \
@@ -193,10 +173,6 @@ EOF
   kubectl_mgc wait deployment/capd-controller-manager \
     -n capd-system \
     --for=condition=Available --timeout=300s
-
-  kind load docker-image "${CAPI_DNS_CONTROLLER_IMAGE}" --name "${KIND_MANAGEMENT_CLUSTER}"
-  kubectl_mgc apply -f "./manifests/crds/connectivity.tanzu.vmware.com_gatewaydns.yaml"
-  kubectl_mgc apply -f "./manifests/capi-dns-controller/deployment.yaml"
 
   local kubeconfig_path="${ROOT_DIR}/${KIND_MANAGEMENT_CLUSTER}.kubeconfig"
   kind get kubeconfig --name management > "${kubeconfig_path}"
@@ -251,21 +227,6 @@ function create_cluster() {
     sleep 5s
   done
 
-  # Deploy Calico cni into CAPD cluster.
-  ${clusterkubectl} apply -f https://docs.projectcalico.org/v3.8/manifests/calico.yaml
-
-  # Deploy cert-manager
-  ${clusterkubectl} apply -f https://github.com/jetstack/cert-manager/releases/download/v1.0.3/cert-manager.yaml
-
-  # Deploy metallb
-  ${clusterkubectl} apply -f https://raw.githubusercontent.com/metallb/metallb/v0.9.5/manifests/namespace.yaml
-  ${clusterkubectl} apply -f https://raw.githubusercontent.com/metallb/metallb/v0.9.5/manifests/metallb.yaml
-  ${clusterkubectl} create secret generic -n metallb-system memberlist --from-literal=secretkey="$(openssl rand -base64 128)"
-  # Each cluster needs to give metallb a config with a CIDR for services it exposes.
-  # The clusters are sharing the address space, so they need non-overalpping
-  # ranges assigned to each cluster.
-  ${clusterkubectl} apply -f "${SCRIPTS_DIR}/metallb/config-${clustername}.yaml"
-
   # Wait until every node is in Ready condition.
   for node in $(${clusterkubectl} get nodes -o json | jq -cr '.items[].metadata.name'); do
     ${clusterkubectl} wait --for=condition=Ready --timeout=300s node/"${node}"
@@ -317,119 +278,22 @@ spec:
 EOF
 }
 
-function load_cluster_images() {
-  kind load docker-image "${DNS_SERVER_IMAGE}" --name "${CLUSTER_A}"
-  kind load docker-image "${DNS_SERVER_IMAGE}" --name "${CLUSTER_B}"
-}
-
-function patch_kube_system_coredns() {
-  local kubeconfig="${1}"
-
-  while [[ -z "$(kubectl get service \
-    --kubeconfig "${kubeconfig}" \
-    -n capi-dns \
-    dns-server -o=jsonpath='{.spec.clusterIP}')" ]]; do
-    sleep 5s;
-  done
-
-  local dns_server_service_ip="$(kubectl get service \
-    --kubeconfig "${kubeconfig}" \
-    -n capi-dns \
-    dns-server -o=jsonpath='{.spec.clusterIP}')"
-
-  kubectl patch configmap coredns \
-    --kubeconfig "${kubeconfig}" \
-    -n kube-system \
-    --type=strategic --patch="$(
-      cat <<EOF
-data:
-  Corefile: |
-    .:53 {
-        errors
-        health {
-           lameduck 5s
-        }
-        ready
-        kubernetes cluster.local in-addr.arpa ip6.arpa {
-           pods insecure
-           fallthrough in-addr.arpa ip6.arpa
-           ttl 30
-        }
-        prometheus :9153
-        forward . /etc/resolv.conf
-        cache 30
-        loop
-        reload
-        loadbalance
-    }
-    xcc.test {
-        forward . ${dns_server_service_ip}
-        reload
-    }
-EOF
-    )"
-}
-
 function e2e_up() {
   check_dependencies
-
   setup_management_cluster
-
-  # Create two clusters
   kubectl_mgc create namespace dev-team
   create_cluster "dev-team" "${CLUSTER_A}"
-  create_cluster "dev-team" "${CLUSTER_B}"
-
-  # Label the clusters so we can install our stuff with ClusterResourceSet
   kubectl_mgc -n dev-team label cluster "${CLUSTER_A}" cross-cluster-connectivity=true --overwrite
-  kubectl_mgc -n dev-team label cluster "${CLUSTER_B}" cross-cluster-connectivity=true --overwrite
-
-  load_cluster_images
   deploy_cluster_resource_set "dev-team"
-
-  patch_kube_system_coredns "${CLUSTER_A_KUBECONFIG}"
-  patch_kube_system_coredns "${CLUSTER_B_KUBECONFIG}"
-
-  # deploy addons for cluster-a
-  kubectl --kubeconfig ${CLUSTER_A_KUBECONFIG} apply -f manifests/contour/
-
-  # deploy addons for cluster-b
-  kubectl --kubeconfig ${CLUSTER_B_KUBECONFIG} apply -f manifests/contour/
-
-  # Label the clusters with the hasContour label for the gateway dns resource
-  kubectl_mgc -n dev-team label cluster "${CLUSTER_A}" hasContour=true --overwrite
-  kubectl_mgc -n dev-team label cluster "${CLUSTER_B}" hasContour=true --overwrite
-
-  for cluster in ${CLUSTER_A} ${CLUSTER_B}; do
-    cat <<EOF
-################################################################################
-cluster artifacts:
-  name: ${cluster}
-  manifest: ${ROOT_DIR}/${cluster}.yaml
-  kubeconfig: ${ROOT_DIR}/${cluster}.kubeconfig
-EOF
-  done
 }
 
 function e2e_down() {
-  # clean up CAPD clusters
-  if [[ -z "${SKIP_CLEANUP_CAPD_CLUSTERS}" ]]; then
-    # our management cluster has to be available to cleanup CAPD
-    # clusters.
-    for cluster in ${CLUSTER_A} ${CLUSTER_B}; do
-      # ignore status
-      kind delete cluster --name "${cluster}" ||
-        echo "cluster ${cluster} deleted."
-      rm -fv "${ROOT_DIR}/${cluster}".kubeconfig* 2>&1 ||
-        echo "${ROOT_DIR}/${cluster}.kubeconfig* deleted"
-    done
-  fi
-  # clean up kind cluster
-  if [[ -z "${SKIP_CLEANUP_MGMT_CLUSTER}" ]]; then
-    # ignore status
-    kind delete cluster --name "${KIND_MANAGEMENT_CLUSTER}" ||
-      echo "kind cluster ${KIND_MANAGEMENT_CLUSTER} deleted."
-  fi
+  kind delete cluster --name "${CLUSTER_A}" ||
+    echo "cluster ${CLUSTER_A} deleted."
+  rm -fv "${ROOT_DIR}/${CLUSTER_A}".kubeconfig* 2>&1 ||
+    echo "${ROOT_DIR}/${CLUSTER_A}.kubeconfig* deleted"
+  kind delete cluster --name "${KIND_MANAGEMENT_CLUSTER}" ||
+    echo "kind cluster ${KIND_MANAGEMENT_CLUSTER} deleted."
   return 0
 }
 
